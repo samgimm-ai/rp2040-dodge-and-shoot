@@ -49,10 +49,19 @@ const INITIAL_SPEED: i32 = 2;
 const MISSILE_W: i32 = 3;
 const MISSILE_H: i32 = 6;
 const MISSILE_SPEED: i32 = 4;
-const MAX_MISSILES: usize = 4;
+const MAX_MISSILES: usize = 8;
+
+// --- Bombs ---
+const MAX_BOMBS: u8 = 3;
+
+// --- Gifts ---
+const GIFT_W: i32 = 10;
+const GIFT_H: i32 = 10;
+const GIFT_SPEED: i32 = 1;
+const MAX_GIFTS: usize = 2;
 
 // --- Particles (debris) ---
-const MAX_PARTICLES: usize = 24;
+const MAX_PARTICLES: usize = 36;
 const PARTICLE_LIFE: u8 = 8;
 
 // --- Lives ---
@@ -123,6 +132,23 @@ impl Particle {
         }
     }
 }
+
+#[derive(Clone, Copy)]
+struct Gift {
+    x: i32,
+    y: i32,
+    life: u8,
+    active: bool,
+}
+
+impl Gift {
+    const fn new() -> Self {
+        Self { x: 0, y: 0, life: 0, active: false }
+    }
+}
+
+const GIFT_MAX_LIFE: u8 = 80; // ~4 seconds at 20 FPS
+const GIFT_FADE_START: u8 = 20; // start fading in last ~1 second
 
 // --- xorshift32 PRNG ---
 struct Rng {
@@ -218,12 +244,19 @@ async fn main(spawner: Spawner) {
     let mut score: u32 = 0;
     let mut lives: u8 = MAX_LIVES;
     let mut spawn_timer: u32 = 0;
+    let mut gifts = [Gift::new(); MAX_GIFTS];
+    let mut gift_spawn_timer: u32 = 0;
+    let mut bombs: u8 = MAX_BOMBS;
+    let mut twin_missile = false;
     let mut rng = Rng::new(12345);
     let mut rng_seeded = false;
     let mut invincible: u32 = 0;
     let mut frame: u32 = 0;
+    let mut demo_mode = false;
     let mut prev_score: u32 = u32::MAX;
     let mut prev_lives: u8 = u8::MAX;
+    let mut prev_bombs: u8 = u8::MAX;
+    let mut prev_twin: bool = true; // force initial HUD draw
     let mut prev_a = false;
     let mut prev_b = false;
     let mut prev_x = false;
@@ -242,6 +275,9 @@ async fn main(spawner: Spawner) {
     let missile_color = Rgb565::YELLOW;
     let life_on = Rgb565::RED;
     let life_off = Rgb565::new(4, 8, 4);
+    let score_highlight_style = MonoTextStyle::new(&FONT_10X20, Rgb565::YELLOW);
+
+    let mut high_score: u32 = 0;
 
     log::info!("Entering game loop");
 
@@ -310,26 +346,29 @@ async fn main(spawner: Spawner) {
                     log::info!("Title screen");
                 }
 
-                if a_just || b_just || x_just || y_just {
-                    // Reset game
+                // A+X simultaneous press → demo mode
+                let start_demo = a_down && x_down;
+                let start_game = !start_demo && (a_just || b_just || x_just || y_just);
+                if start_demo || start_game {
+                    demo_mode = start_demo;
                     player_x = (SCREEN_W - PLAYER_W) / 2;
-                    for obs in obstacles.iter_mut() {
-                        obs.active = false;
-                    }
-                    for m in missiles.iter_mut() {
-                        m.active = false;
-                    }
-                    for p in particles.iter_mut() {
-                        p.life = 0;
-                    }
+                    for obs in obstacles.iter_mut() { obs.active = false; }
+                    for m in missiles.iter_mut() { m.active = false; }
+                    for p in particles.iter_mut() { p.life = 0; }
+                    for g in gifts.iter_mut() { g.active = false; }
                     score = 0;
                     lives = MAX_LIVES;
+                    bombs = MAX_BOMBS;
+                    twin_missile = false;
                     spawn_timer = 0;
+                    gift_spawn_timer = 0;
                     invincible = 0;
                     prev_score = u32::MAX;
                     prev_lives = u8::MAX;
+                    prev_bombs = u8::MAX;
+                    prev_twin = true;
                     game_state = GameState::Playing;
-                    log::info!("Game start!");
+                    log::info!("{} start!", if demo_mode { "Demo" } else { "Game" });
                 }
             }
 
@@ -339,25 +378,122 @@ async fn main(spawner: Spawner) {
                 if prev_state != GameState::Playing {
                     display.clear(Rgb565::BLACK).unwrap();
                     led.set_high();
+                    if demo_mode {
+                        let demo_style = MonoTextStyle::new(&FONT_6X10, Rgb565::new(8, 16, 8));
+                        Text::with_baseline("DEMO", Point::new(105, 2), demo_style, Baseline::Top)
+                            .draw(&mut display).unwrap();
+                    }
                     prev_state = GameState::Playing;
                 }
 
-                // --- Input: movement ---
-                if b_down {
+                // Demo mode: any button press → back to title
+                if demo_mode && (a_just || b_just || x_just || y_just) {
+                    game_state = GameState::Title;
+                    log::info!("Demo exit");
+                    frame = frame.wrapping_add(1);
+                    Timer::at(frame_start + Duration::from_millis(50)).await;
+                    continue;
+                }
+
+                // --- Input (demo AI or real buttons) ---
+                let (move_left, move_right, fire, use_bomb) = if demo_mode {
+                    let player_cx = player_x + PLAYER_W / 2;
+                    let mut ai_left = false;
+                    let mut ai_right = false;
+                    let mut ai_fire = frame % 8 == 0;
+                    let mut ai_bomb = false;
+
+                    // Count active obstacles for bomb decision
+                    let mut obs_count = 0u8;
+                    let mut nearest_y = -1i32;
+                    let mut nearest_x = 0i32;
+                    for obs in obstacles.iter() {
+                        if obs.active {
+                            obs_count += 1;
+                            if obs.y > nearest_y {
+                                nearest_x = obs.x + OBS_W / 2;
+                                nearest_y = obs.y;
+                            }
+                        }
+                    }
+
+                    // Use bomb when overwhelmed
+                    if obs_count >= 4 && bombs > 0 {
+                        ai_bomb = true;
+                    }
+
+                    if nearest_y >= 0 {
+                        let dx = nearest_x - player_cx;
+                        if nearest_y > PLAYER_Y - 30 && dx.abs() < PLAYER_W + 4 {
+                            if dx >= 0 { ai_left = true; } else { ai_right = true; }
+                        } else {
+                            if dx > 4 { ai_right = true; }
+                            else if dx < -4 { ai_left = true; }
+                            else { ai_fire = true; }
+                        }
+                    }
+                    (ai_left, ai_right, ai_fire, ai_bomb)
+                } else {
+                    let both_fire = a_down && x_down;
+                    let bomb_just = both_fire && (a_just || x_just);
+                    let fire_just = !both_fire && (a_just || x_just);
+                    (b_down, y_down, fire_just, bomb_just)
+                };
+
+                if move_left {
                     player_x = (player_x - PLAYER_SPEED).max(0);
                 }
-                if y_down {
+                if move_right {
                     player_x = (player_x + PLAYER_SPEED).min(SCREEN_W - PLAYER_W);
                 }
 
-                // --- Input: fire missile (A or X) ---
-                if a_just || x_just {
-                    for m in missiles.iter_mut() {
-                        if !m.active {
-                            m.x = player_x + PLAYER_W / 2 - MISSILE_W / 2;
-                            m.y = PLAYER_Y - MISSILE_H;
-                            m.active = true;
-                            break;
+                // --- Bomb: destroy all obstacles ---
+                if use_bomb && bombs > 0 {
+                    bombs -= 1;
+                    for obs in obstacles.iter_mut() {
+                        if obs.active {
+                            let cx = obs.x + OBS_W / 2;
+                            let cy = obs.y + OBS_H / 2;
+                            let mut spawned = 0;
+                            for p in particles.iter_mut() {
+                                if p.life == 0 && spawned < 4 {
+                                    p.x = cx + rng.range(OBS_W) - OBS_W / 2;
+                                    p.y = cy + rng.range(OBS_H) - OBS_H / 2;
+                                    p.dx = rng.range(7) - 3;
+                                    p.dy = rng.range(7) - 3;
+                                    if p.dx == 0 && p.dy == 0 { p.dy = -1; }
+                                    p.life = PARTICLE_LIFE;
+                                    spawned += 1;
+                                }
+                            }
+                            obs.active = false;
+                            score += 2;
+                        }
+                    }
+                    log::info!("BOMB! Bombs left: {}", bombs);
+                }
+
+                // --- Fire missile (single or twin) ---
+                if fire {
+                    if twin_missile {
+                        // Twin: two missiles side by side
+                        let mut fired = 0u8;
+                        for m in missiles.iter_mut() {
+                            if !m.active && fired < 2 {
+                                m.x = player_x + if fired == 0 { 4 } else { PLAYER_W - 4 - MISSILE_W };
+                                m.y = PLAYER_Y - MISSILE_H;
+                                m.active = true;
+                                fired += 1;
+                            }
+                        }
+                    } else {
+                        for m in missiles.iter_mut() {
+                            if !m.active {
+                                m.x = player_x + PLAYER_W / 2 - MISSILE_W / 2;
+                                m.y = PLAYER_Y - MISSILE_H;
+                                m.active = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -389,6 +525,31 @@ async fn main(spawner: Spawner) {
                     if obs.y > SCREEN_H {
                         obs.active = false;
                         score += 1;
+                    }
+                }
+
+                // --- Spawn gifts (random, ~every 200 frames) ---
+                gift_spawn_timer += 1;
+                if gift_spawn_timer >= 200 && rng.range(100) < 15 {
+                    gift_spawn_timer = 0;
+                    for g in gifts.iter_mut() {
+                        if !g.active {
+                            g.x = rng.range(SCREEN_W - GIFT_W);
+                            g.y = HUD_H;
+                            g.life = GIFT_MAX_LIFE;
+                            g.active = true;
+                            break;
+                        }
+                    }
+                }
+
+                // --- Move gifts (fade out over time) ---
+                for g in gifts.iter_mut() {
+                    if !g.active { continue; }
+                    g.y += GIFT_SPEED;
+                    g.life = g.life.saturating_sub(1);
+                    if g.life == 0 {
+                        g.active = false;
                     }
                 }
 
@@ -458,20 +619,62 @@ async fn main(spawner: Spawner) {
                     }
                 }
 
+                // --- Missile-gift collision ---
+                for mi in 0..MAX_MISSILES {
+                    if !missiles[mi].active { continue; }
+                    for gi in 0..MAX_GIFTS {
+                        if !gifts[gi].active { continue; }
+                        if aabb_overlap(
+                            missiles[mi].x, missiles[mi].y, MISSILE_W, MISSILE_H,
+                            gifts[gi].x, gifts[gi].y, GIFT_W, GIFT_H,
+                        ) {
+                            missiles[mi].active = false;
+                            gifts[gi].active = false;
+                            // Random power-up (0=bomb, 1=life, 2=twin)
+                            let roll = rng.range(3);
+                            if roll == 0 {
+                                bombs = (bombs + 1).min(MAX_BOMBS);
+                                log::info!("Gift: Bomb+1 ({})", bombs);
+                            } else if roll == 1 {
+                                lives = (lives + 1).min(MAX_LIVES);
+                                log::info!("Gift: Life+1 ({})", lives);
+                            } else {
+                                twin_missile = true;
+                                log::info!("Gift: Twin Missile!");
+                            }
+                            // Sparkle particles
+                            let cx = gifts[gi].x + GIFT_W / 2;
+                            let cy = gifts[gi].y + GIFT_H / 2;
+                            let mut spawned = 0;
+                            for p in particles.iter_mut() {
+                                if p.life == 0 && spawned < 4 {
+                                    p.x = cx + rng.range(GIFT_W) - GIFT_W / 2;
+                                    p.y = cy + rng.range(GIFT_H) - GIFT_H / 2;
+                                    p.dx = rng.range(5) - 2;
+                                    p.dy = rng.range(5) - 2;
+                                    if p.dx == 0 && p.dy == 0 { p.dy = -1; }
+                                    p.life = PARTICLE_LIFE;
+                                    spawned += 1;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+
                 // --- Player-obstacle collision ---
                 if invincible > 0 {
                     invincible -= 1;
                 } else {
                     for obs in obstacles.iter_mut() {
-                        if !obs.active {
-                            continue;
-                        }
+                        if !obs.active { continue; }
                         if aabb_overlap(
                             player_x, PLAYER_Y, PLAYER_W, PLAYER_H, obs.x, obs.y, OBS_W,
                             OBS_H,
                         ) {
                             obs.active = false;
                             lives = lives.saturating_sub(1);
+                            twin_missile = false; // reset twin on hit
                             invincible = 20;
                             log::info!("Hit! Lives: {}", lives);
                             if lives == 0 {
@@ -502,6 +705,26 @@ async fn main(spawner: Spawner) {
                         Size::new(OBS_W as u32, OBS_H as u32),
                     )
                     .into_styled(PrimitiveStyle::with_fill(obs_color))
+                    .draw(&mut display)
+                    .unwrap();
+                }
+
+                // Draw gifts (blink when fading)
+                for g in &gifts {
+                    if !g.active { continue; }
+                    if g.life <= GIFT_FADE_START && frame % 4 < 2 {
+                        continue; // blink effect when fading
+                    }
+                    let gift_color = if g.life > GIFT_FADE_START {
+                        Rgb565::GREEN
+                    } else {
+                        Rgb565::new(0, 20, 0) // dim green when fading
+                    };
+                    Rectangle::new(
+                        Point::new(g.x, g.y),
+                        Size::new(GIFT_W as u32, GIFT_H as u32),
+                    )
+                    .into_styled(PrimitiveStyle::with_fill(gift_color))
                     .draw(&mut display)
                     .unwrap();
                 }
@@ -580,28 +803,61 @@ async fn main(spawner: Spawner) {
                     }
                     prev_lives = lives;
                 }
+
+                // --- HUD: bombs + twin indicator (update only when changed) ---
+                if bombs != prev_bombs || twin_missile != prev_twin {
+                    Rectangle::new(Point::new(120, 0), Size::new(80, HUD_H as u32))
+                        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+                        .draw(&mut display)
+                        .unwrap();
+                    let bomb_on = Rgb565::new(0, 31, 0);
+                    let bomb_off = Rgb565::new(2, 8, 2);
+                    for i in 0..MAX_BOMBS {
+                        let color = if i < bombs { bomb_on } else { bomb_off };
+                        let bx = 122 + (i as i32) * 10;
+                        Rectangle::new(Point::new(bx, 3), Size::new(7, 8))
+                            .into_styled(PrimitiveStyle::with_fill(color))
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                    if twin_missile {
+                        let tw_style = MonoTextStyle::new(&FONT_6X10, Rgb565::YELLOW);
+                        Text::with_baseline("W", Point::new(156, 2), tw_style, Baseline::Top)
+                            .draw(&mut display).unwrap();
+                    }
+                    prev_bombs = bombs;
+                    prev_twin = twin_missile;
+                }
             }
 
             // ==================== GAME OVER ====================
             GameState::GameOver => {
                 if prev_state != GameState::GameOver {
+                    if score > high_score {
+                        high_score = score;
+                    }
                     display.clear(Rgb565::BLACK).unwrap();
                     Text::with_baseline(
                         "GAME OVER",
-                        Point::new(75, 25),
+                        Point::new(75, 15),
                         gameover_style,
                         Baseline::Top,
                     )
                     .draw(&mut display)
                     .unwrap();
                     buf.clear();
-                    core::write!(buf, "Score: {}", score).ok();
-                    Text::with_baseline(&buf, Point::new(90, 60), info_style, Baseline::Top)
+                    core::write!(buf, "{}", score).ok();
+                    Text::with_baseline(&buf, Point::new(105, 45), score_highlight_style, Baseline::Top)
+                        .draw(&mut display)
+                        .unwrap();
+                    buf.clear();
+                    core::write!(buf, "Best: {}", high_score).ok();
+                    Text::with_baseline(&buf, Point::new(90, 75), info_style, Baseline::Top)
                         .draw(&mut display)
                         .unwrap();
                     Text::with_baseline(
                         "Press any button",
-                        Point::new(72, 90),
+                        Point::new(72, 100),
                         info_style,
                         Baseline::Top,
                     )
@@ -612,7 +868,12 @@ async fn main(spawner: Spawner) {
                     log::info!("Game Over screen");
                 }
 
-                if a_just || b_just || x_just || y_just {
+                if demo_mode {
+                    // Demo: auto-return to title after brief pause
+                    if frame % 40 == 0 {
+                        game_state = GameState::Title;
+                    }
+                } else if a_just || b_just || x_just || y_just {
                     game_state = GameState::Title;
                 }
             }
