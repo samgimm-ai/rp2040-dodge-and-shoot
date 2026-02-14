@@ -248,6 +248,8 @@ async fn main(spawner: Spawner) {
     let mut gift_spawn_timer: u32 = 0;
     let mut bombs: u8 = MAX_BOMBS;
     let mut twin_missile = false;
+    let mut twin_timer: u32 = 0;
+    const TWIN_DURATION: u32 = 200; // 10 seconds at 20 FPS
     let mut rng = Rng::new(12345);
     let mut rng_seeded = false;
     let mut invincible: u32 = 0;
@@ -360,6 +362,7 @@ async fn main(spawner: Spawner) {
                     lives = MAX_LIVES;
                     bombs = MAX_BOMBS;
                     twin_missile = false;
+                    twin_timer = 0;
                     spawn_timer = 0;
                     gift_spawn_timer = 0;
                     invincible = 0;
@@ -640,7 +643,8 @@ async fn main(spawner: Spawner) {
                                 log::info!("Gift: Life+1 ({})", lives);
                             } else {
                                 twin_missile = true;
-                                log::info!("Gift: Twin Missile!");
+                                twin_timer = TWIN_DURATION;
+                                log::info!("Gift: Twin Missile! (10s)");
                             }
                             // Sparkle particles
                             let cx = gifts[gi].x + GIFT_W / 2;
@@ -674,7 +678,8 @@ async fn main(spawner: Spawner) {
                         ) {
                             obs.active = false;
                             lives = lives.saturating_sub(1);
-                            twin_missile = false; // reset twin on hit
+                            twin_missile = false;
+                            twin_timer = 0;
                             invincible = 20;
                             log::info!("Hit! Lives: {}", lives);
                             if lives == 0 {
@@ -683,6 +688,15 @@ async fn main(spawner: Spawner) {
                                 break;
                             }
                         }
+                    }
+                }
+
+                // --- Twin missile timer ---
+                if twin_missile {
+                    twin_timer = twin_timer.saturating_sub(1);
+                    if twin_timer == 0 {
+                        twin_missile = false;
+                        log::info!("Twin missile expired");
                     }
                 }
 
