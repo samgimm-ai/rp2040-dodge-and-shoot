@@ -1,0 +1,61 @@
+[package]
+name = "rasp-pico-hello"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Embassy core
+embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread", "defmt"] }
+embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-rp = { version = "0.9", features = ["defmt", "time-driver", "critical-section-impl", "rp2040", "binary-info"] }
+
+# Cortex-M support
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+
+# USB serial logging
+embassy-usb = { version = "0.5", features = ["defmt"] }
+embassy-usb-logger = "0.5"
+log = "0.4"
+
+# Logging
+defmt = "1"
+defmt-rtt = "1"
+panic-probe = { version = "1", features = ["print-defmt"] }
+
+# Display (ST7789 via SPI)
+mipidsi = "0.9"
+embedded-graphics = "0.8"
+embedded-hal-bus = "0.2"
+heapless = "0.8"
+
+# Static allocation for Embassy resources
+static_cell = "2.1"
+portable-atomic = { version = "1", features = ["critical-section"] }
+
+# cargo build/run
+[profile.dev]
+debug = 2
+debug-assertions = true
+opt-level = 2
+overflow-checks = true
+
+# cargo build/run --release
+[profile.release]
+debug = 2
+debug-assertions = false
+lto = 'fat'
+opt-level = 2
+overflow-checks = false
+
+[profile.dev.build-override]
+debug = false
+debug-assertions = false
+overflow-checks = false
+opt-level = 0
+
+[profile.release.build-override]
+debug = false
+debug-assertions = false
+overflow-checks = false
+opt-level = 0

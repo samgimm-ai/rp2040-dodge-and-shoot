@@ -1,0 +1,4 @@
+target/
+**/*.rs.bk
+*.uf2
+.gdb_history
