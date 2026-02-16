@@ -22,7 +22,7 @@ use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_10X20};
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
+use embedded_graphics::primitives::{Line, PrimitiveStyle, Rectangle};
 use embedded_graphics::text::{Baseline, Text};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use mipidsi::models::ST7789;
@@ -52,8 +52,6 @@ const MISSILE_W: i32 = 3;
 const MISSILE_H: i32 = 6;
 const MISSILE_SPEED: i32 = 4;
 const MAX_MISSILES: usize = 8;
-const HOMING_TURN: i32 = 2;
-
 // --- Bombs ---
 const MAX_BOMBS: u8 = 3;
 
@@ -70,9 +68,6 @@ const FREEZE_DURATION: u32 = 100;  // 5 seconds
 const HOMING_DURATION: u32 = 200;  // 10 seconds
 const LASER_DURATION: u32 = 100;   // 5 seconds
 const SHIELD_DURATION: u32 = 160;  // 8 seconds
-
-// --- Laser ---
-const LASER_W: i32 = 2;
 
 // --- Particles ---
 const MAX_PARTICLES: usize = 36;
@@ -246,6 +241,7 @@ async fn main(spawner: Spawner) {
     let mut prev_y = false;
     let mut buf = heapless::String::<32>::new();
     let mut high_score: u32 = 0;
+    let mut speed_base_score: u32 = 0;
 
     // Text styles
     let big_yellow = MonoTextStyle::new(&FONT_10X20, Rgb565::YELLOW);
@@ -323,6 +319,7 @@ async fn main(spawner: Spawner) {
                     spawn_timer = 0;
                     gift_spawn_timer = 0;
                     invincible = 0;
+                    speed_base_score = 0;
                     prev_score = u32::MAX;
                     prev_lives = u8::MAX;
                     prev_bombs = u8::MAX;
@@ -401,20 +398,31 @@ async fn main(spawner: Spawner) {
                             score += 2;
                         }
                     }
-                    log::info!("BOMB! left: {}", bombs);
+                    speed_base_score = score;
+                    log::info!("BOMB! left: {}, speed reset", bombs);
                 }
 
-                // --- Laser beam ---
+                // --- Laser beam (auto-target nearest obstacle) ---
                 let laser_on = laser_timer > 0 && (a_down || x_down || demo_mode);
+                let mut laser_tx = 0i32;
+                let mut laser_ty = 0i32;
+                let mut laser_hit = false;
                 if laser_on {
-                    let lx = player_x + PLAYER_W / 2 - LASER_W / 2;
-                    for obs in obstacles.iter_mut() {
+                    let pcx = player_x + PLAYER_W / 2;
+                    let mut best = i32::MAX;
+                    let mut ti: Option<usize> = None;
+                    for (i, obs) in obstacles.iter().enumerate() {
                         if !obs.active { continue; }
-                        if aabb_overlap(lx, HUD_H, LASER_W, PLAYER_Y - HUD_H, obs.x, obs.y, OBS_W, OBS_H) {
-                            spawn_particles(&mut particles, &mut rng, obs.x + OBS_W / 2, obs.y + OBS_H / 2, 3);
-                            obs.active = false;
-                            score += 2;
-                        }
+                        let d = (obs.x + OBS_W / 2 - pcx).abs() + (obs.y + OBS_H / 2 - PLAYER_Y).abs();
+                        if d < best { best = d; ti = Some(i); }
+                    }
+                    if let Some(i) = ti {
+                        laser_tx = obstacles[i].x + OBS_W / 2;
+                        laser_ty = obstacles[i].y + OBS_H / 2;
+                        laser_hit = true;
+                        spawn_particles(&mut particles, &mut rng, laser_tx, laser_ty, 3);
+                        obstacles[i].active = false;
+                        score += 2;
                     }
                 }
 
@@ -444,14 +452,15 @@ async fn main(spawner: Spawner) {
                     }
                 }
 
-                // --- Obstacle speed (0 when frozen) ---
+                // --- Obstacle speed (0 when frozen, reset by bomb) ---
+                let progress = score.saturating_sub(speed_base_score);
                 let speed = if freeze_timer > 0 { 0 } else {
-                    (INITIAL_SPEED + (score / 10) as i32).min(6)
+                    (INITIAL_SPEED + (progress / 10) as i32).min(6)
                 };
 
                 // --- Spawn obstacles ---
                 spawn_timer += 1;
-                let interval = 30u32.saturating_sub((score / 10) * 5).max(10);
+                let interval = 30u32.saturating_sub((progress / 10) * 5).max(10);
                 if spawn_timer >= interval {
                     spawn_timer = 0;
                     for obs in obstacles.iter_mut() {
@@ -494,21 +503,29 @@ async fn main(spawner: Spawner) {
                     if g.life == 0 { g.active = false; }
                 }
 
-                // --- Move missiles ---
+                // --- Move missiles (homing uses proportional navigation) ---
                 for m in missiles.iter_mut() {
                     if !m.active { continue; }
                     m.y -= MISSILE_SPEED;
                     if m.homing {
+                        let mcx = m.x + MISSILE_W / 2;
                         let mut best = i32::MAX;
-                        let mut tx = m.x;
+                        let mut tx = mcx;
+                        let mut ty = m.y;
                         for obs in obstacles.iter() {
-                            if obs.active {
-                                let d = (obs.y - m.y).abs() + (obs.x - m.x).abs();
-                                if d < best { best = d; tx = obs.x + OBS_W / 2 - MISSILE_W / 2; }
-                            }
+                            if !obs.active { continue; }
+                            let ocx = obs.x + OBS_W / 2;
+                            let ocy = obs.y + OBS_H / 2;
+                            let d = (ocy - m.y).abs() + (ocx - mcx).abs();
+                            if d < best { best = d; tx = ocx; ty = ocy; }
                         }
-                        if tx > m.x { m.x = (m.x + HOMING_TURN).min(tx); }
-                        else if tx < m.x { m.x = (m.x - HOMING_TURN).max(tx); }
+                        // Proportional steering: calculate frames to intercept
+                        let dy = m.y - ty;
+                        let frames = (dy / (MISSILE_SPEED + speed)).max(1);
+                        let dx = tx - mcx;
+                        let mut turn = dx / frames;
+                        if turn == 0 && dx != 0 { turn = if dx > 0 { 1 } else { -1 }; }
+                        m.x += turn.clamp(-6, 6);
                     }
                     if m.y < HUD_H { m.active = false; }
                 }
@@ -557,7 +574,18 @@ async fn main(spawner: Spawner) {
                             match rng.range(6) {
                                 0 => { bombs = (bombs + 1).min(MAX_BOMBS); log::info!("Gift: Bomb+1"); }
                                 1 => { lives = (lives + 1).min(MAX_LIVES); log::info!("Gift: Life+1"); }
-                                2 => { freeze_timer = FREEZE_DURATION; log::info!("Gift: Freeze!"); }
+                                2 => {
+                                    freeze_timer = FREEZE_DURATION;
+                                    // Remove obstacles near the bottom
+                                    for oi in 0..MAX_OBS {
+                                        if obstacles[oi].active && obstacles[oi].y + OBS_H >= PLAYER_Y - 5 {
+                                            spawn_particles(&mut particles, &mut rng,
+                                                obstacles[oi].x + OBS_W / 2, obstacles[oi].y + OBS_H / 2, 3);
+                                            obstacles[oi].active = false;
+                                        }
+                                    }
+                                    log::info!("Gift: Freeze!");
+                                }
                                 3 => { homing_timer = HOMING_DURATION; log::info!("Gift: Homing!"); }
                                 4 => { laser_timer = LASER_DURATION; log::info!("Gift: Laser!"); }
                                 _ => { shield_timer = SHIELD_DURATION; log::info!("Gift: Shield!"); }
@@ -604,15 +632,12 @@ async fn main(spawner: Spawner) {
                 .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
                 .draw(&mut display).unwrap();
 
-                // Laser beam
-                if laser_on {
-                    let lx = player_x + PLAYER_W / 2 - LASER_W / 2;
-                    Rectangle::new(
-                        Point::new(lx, HUD_H),
-                        Size::new(LASER_W as u32, (PLAYER_Y - HUD_H) as u32),
-                    )
-                    .into_styled(PrimitiveStyle::with_fill(laser_color))
-                    .draw(&mut display).unwrap();
+                // Laser beam (line to target)
+                if laser_on && laser_hit {
+                    let pcx = player_x + PLAYER_W / 2;
+                    Line::new(Point::new(pcx, PLAYER_Y), Point::new(laser_tx, laser_ty))
+                        .into_styled(PrimitiveStyle::with_stroke(laser_color, 1))
+                        .draw(&mut display).unwrap();
                 }
 
                 // Obstacles (blue when frozen)
